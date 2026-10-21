@@ -192,6 +192,14 @@ ask_inputs() {
   AUTO_REBOOT=0
   confirm "Redémarrage automatique à 4h si une mise à jour l'exige (noyau, libc...) ?" o && AUTO_REBOOT=1
 
+  DOCKER=0 DOCKER_GROUP=0
+  if command -v docker &>/dev/null; then
+    warn "Docker est déjà installé, étape Docker ignorée."
+  elif confirm "Installer Docker (Engine + Compose, script officiel get.docker.com) ?" n; then
+    DOCKER=1
+    confirm "Ajouter $NEW_USER au groupe docker (docker sans sudo, équivalent à un accès root) ?" n && DOCKER_GROUP=1
+  fi
+
   echo
   info "Récapitulatif"
   echo "  Utilisateur : $NEW_USER (sudo, connexion par clé uniquement)"
@@ -202,6 +210,7 @@ ask_inputs() {
   echo "  Sauvegarde  : $( ((BACKUP)) && echo oui || echo non)"
   echo "  Reboot auto : $( ((AUTO_REBOOT)) && echo 'oui (4h)' || echo non)"
   echo "  Verrouiller : $( ((LOCK_OTHERS)) && echo "$OTHER_USERS" || echo aucun)"
+  echo "  Docker      : $( ((DOCKER)) && echo "oui$( ((DOCKER_GROUP)) && echo ', groupe docker pour '"$NEW_USER")" || echo non)"
   echo "  + mise à jour système, Fail2ban, mises à jour de sécurité automatiques"
   confirm "Lancer la configuration ?" o || die "Annulé."
 }
@@ -374,6 +383,35 @@ step_backup() {
 EOF
 }
 
+step_docker() {
+  (( DOCKER )) || return 0
+  info "Docker"
+  local installer
+  installer=$(mktemp)
+  # Téléchargé puis exécuté : un téléchargement interrompu ne lance rien
+  curl -fsSL --max-time 60 https://get.docker.com -o "$installer"
+  sh "$installer"
+  rm -f "$installer"
+
+  # Rotation des logs (sinon les logs de conteneurs grossissent sans limite), sans écraser une config existante
+  if [[ ! -f /etc/docker/daemon.json ]]; then
+    install -d -m 755 /etc/docker
+    cat >/etc/docker/daemon.json <<'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}
+EOF
+  fi
+  systemctl enable docker
+  systemctl restart docker
+
+  if (( DOCKER_GROUP )); then usermod -aG docker "$NEW_USER"; fi
+  docker --version
+  docker compose version
+  warn "Docker contourne UFW pour les ports publiés (-p). Publier sur 127.0.0.1 ou filtrer via le pare-feu de l'hébergeur."
+}
+
 step_lock_others() {
   (( LOCK_OTHERS )) || return 0
   info "Verrouillage des comptes : $OTHER_USERS"
@@ -446,6 +484,7 @@ main() {
   step_fail2ban
   step_autoupdates
   step_backup
+  step_docker
   step_finalize
   summary
 }

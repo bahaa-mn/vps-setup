@@ -19,6 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/bahaa-mn/vps-setup/main/setup.sh | 
 - ports à ouvrir dans UFW (`80,443` par défaut, plages et UDP acceptés : `8000:8100/udp`)
 - clé SSH publique : reprise de celle de root, collée, ou importée depuis `github.com/<user>.keys`
 - fuseau horaire, hostname
+- installation de Docker (optionnelle, script officiel get.docker.com), avec ou sans accès au groupe `docker`
 - verrouillage des autres comptes de l'image cloud (`ubuntu`...), sauvegarde quotidienne de `/etc`, redémarrage automatique à 4h après une mise à jour du noyau
 
 ## Après le script
