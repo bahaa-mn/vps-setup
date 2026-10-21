@@ -20,7 +20,32 @@ curl -fsSL https://raw.githubusercontent.com/bahaa-mn/vps-setup/main/setup.sh | 
 - clé SSH publique : reprise de celle de root, collée, ou importée depuis `github.com/<user>.keys`
 - fuseau horaire, hostname
 - installation de Docker (optionnelle, script officiel get.docker.com), avec ou sans accès au groupe `docker`
+- utilisateur dédié Coolify (optionnel, `coolify` par défaut) pour connecter le serveur à un Coolify central, selon la [doc non-root user](https://coolify.io/docs/core/infrastructure/servers/non-root-user) : clé publique générée dans Coolify, sudo sans mot de passe, `/data/coolify`, ajouté à `AllowUsers`
 - verrouillage des autres comptes de l'image cloud (`ubuntu`...), sauvegarde quotidienne de `/etc`, redémarrage automatique à 4h après une mise à jour du noyau
+
+## Lancer une seule étape
+
+Une fois la configuration de base faite, certaines étapes peuvent être lancées seules, en passant leur nom en paramètre (depuis l'utilisateur admin, avec `sudo`) :
+
+| Étape     | Ce qu'elle fait |
+|-----------|-----------------|
+| `docker`  | installe Docker Engine + Compose (get.docker.com), rotation des logs, groupe `docker` optionnel pour l'utilisateur qui lance `sudo` |
+| `coolify` | crée l'utilisateur Coolify (clé, sudo sans mot de passe, `/data/coolify`) et l'ajoute à `AllowUsers` dans `/etc/ssh/sshd_config.d/00-hardening.conf` |
+| `backup`  | sauvegarde quotidienne de `/etc` à 2h dans `/opt/backups` (14 jours) |
+
+Exemple Coolify (générer d'abord la clé dans Coolify : Keys & Tokens > Private Keys > Generate ED25519) :
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bahaa-mn/vps-setup/main/setup.sh | sudo bash -s -- coolify
+```
+
+Puis dans Coolify : Servers > Add, avec l'IP du VPS, le port SSH, l'utilisateur `coolify` et la clé générée.
+
+Exemple Docker :
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/bahaa-mn/vps-setup/main/setup.sh | sudo bash -s -- docker
+```
 
 ## Après le script
 
