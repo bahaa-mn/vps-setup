@@ -4,6 +4,9 @@
 # Usage (en root ou via sudo) :
 #   curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/setup.sh | sudo bash
 #
+# Une seule étape, après la configuration de base :
+#   curl -fsSL .../setup.sh | sudo bash -s -- <docker|coolify|backup>
+#
 # Les réponses sont lues sur /dev/tty, donc le mode "curl | bash" reste interactif.
 # Le port 22 reste ouvert tant que la connexion sur le nouveau port n'a pas été validée,
 # et un filet de sécurité restaure la config SSH initiale si rien n'est validé à temps.
@@ -115,8 +118,13 @@ ask_inputs() {
     done
   fi
 
+  COOLIFY_USER="" COOLIFY_KEY=""
+  if confirm "Créer un utilisateur dédié pour connecter ce serveur à un Coolify central ?" n; then
+    ask_coolify
+  fi
+
   # Autres comptes humains (ex: "ubuntu" créé par l'image cloud, souvent avec sudo sans mot de passe)
-  OTHER_USERS=$(awk -F: -v u="$NEW_USER" '$3>=1000 && $3<60000 && $1!=u && $7!~/(nologin|false)$/ {print $1}' /etc/passwd | xargs)
+  OTHER_USERS=$(awk -F: -v u="$NEW_USER" -v c="$COOLIFY_USER" '$3>=1000 && $3<60000 && $1!=u && $1!=c && $7!~/(nologin|false)$/ {print $1}' /etc/passwd | xargs)
   LOCK_OTHERS=0
   if [[ -n $OTHER_USERS ]]; then
     confirm "Verrouiller les autres comptes utilisateurs ($OTHER_USERS) une fois l'accès validé ?" o && LOCK_OTHERS=1
@@ -196,8 +204,7 @@ ask_inputs() {
   if command -v docker &>/dev/null; then
     warn "Docker est déjà installé, étape Docker ignorée."
   elif confirm "Installer Docker (Engine + Compose, script officiel get.docker.com) ?" n; then
-    DOCKER=1
-    confirm "Ajouter $NEW_USER au groupe docker (docker sans sudo, équivalent à un accès root) ?" n && DOCKER_GROUP=1
+    ask_docker
   fi
 
   echo
@@ -211,8 +218,38 @@ ask_inputs() {
   echo "  Reboot auto : $( ((AUTO_REBOOT)) && echo 'oui (4h)' || echo non)"
   echo "  Verrouiller : $( ((LOCK_OTHERS)) && echo "$OTHER_USERS" || echo aucun)"
   echo "  Docker      : $( ((DOCKER)) && echo "oui$( ((DOCKER_GROUP)) && echo ', groupe docker pour '"$NEW_USER")" || echo non)"
+  echo "  Coolify     : $( [[ -n $COOLIFY_USER ]] && echo "$COOLIFY_USER (sudo sans mot de passe, clé Coolify uniquement)" || echo non)"
   echo "  + mise à jour système, Fail2ban, mises à jour de sécurité automatiques"
   confirm "Lancer la configuration ?" o || die "Annulé."
+}
+
+# Compte dédié à un serveur Coolify central (doc : coolify.io/docs/core/infrastructure/servers/non-root-user)
+ask_coolify() {
+  local p
+  while :; do
+    ask COOLIFY_USER "Nom de l'utilisateur Coolify" "coolify"
+    if [[ ! $COOLIFY_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ || $COOLIFY_USER == root || $COOLIFY_USER == "$NEW_USER" ]]; then
+      warn "Nom invalide (minuscules, chiffres, _ ou -, 32 caractères max, ni root ni l'utilisateur admin)."
+    elif id "$COOLIFY_USER" &>/dev/null && (( $(id -u "$COOLIFY_USER") < 1000 )); then
+      warn "$COOLIFY_USER est un compte système (UID < 1000), choisir un autre nom."
+    else
+      break
+    fi
+  done
+  echo "Dans Coolify : Keys & Tokens > Private Keys > New private key > Generate ED25519 (sans passphrase), copier la clé publique."
+  while :; do
+    ask p "Clé publique générée par Coolify"
+    COOLIFY_KEY=$(extract_keys <<<"$p" | head -n1)
+    [[ -n $COOLIFY_KEY ]] && ssh-keygen -lf <(printf '%s\n' "$COOLIFY_KEY") 2>/dev/null && break
+    warn "Clé invalide, recommencer."
+  done
+}
+
+ask_docker() {
+  DOCKER=1
+  if [[ -n $NEW_USER ]] && confirm "Ajouter $NEW_USER au groupe docker (docker sans sudo, équivalent à un accès root) ?" n; then
+    DOCKER_GROUP=1
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -245,16 +282,61 @@ step_user() {
   fi
   usermod -aG sudo "$NEW_USER"
 
+  install_keys "$NEW_USER" "$SSH_KEYS"
+}
+
+# install_keys user "clés" : ajoute les clés manquantes à ~user/.ssh/authorized_keys
+install_keys() {
   local home ak k
-  home=$(getent passwd "$NEW_USER" | cut -d: -f6)
+  home=$(getent passwd "$1" | cut -d: -f6)
   ak="$home/.ssh/authorized_keys"
-  install -d -m 700 -o "$NEW_USER" -g "$NEW_USER" "$home/.ssh"
+  install -d -m 700 -o "$1" -g "$1" "$home/.ssh"
   touch "$ak"
   while IFS= read -r k; do
     if ! grep -qxF "$k" "$ak"; then echo "$k" >>"$ak"; fi
-  done <<<"$SSH_KEYS"
-  chown "$NEW_USER:$NEW_USER" "$ak"
+  done <<<"$2"
+  chown "$1:$1" "$ak"
   chmod 600 "$ak"
+}
+
+step_coolify() {
+  [[ -n $COOLIFY_USER ]] || return 0
+  info "Utilisateur Coolify $COOLIFY_USER"
+  # 'NP' : compte déverrouillé mais sans mot de passe utilisable (un compte verrouillé refuse les clés SSH)
+  if ! id "$COOLIFY_USER" &>/dev/null; then
+    useradd --create-home --user-group --shell /bin/bash --password 'NP' "$COOLIFY_USER"
+  elif [[ $(passwd -S "$COOLIFY_USER" | awk '{print $2}') == L ]]; then
+    usermod -p 'NP' "$COOLIFY_USER"
+  fi
+  install_keys "$COOLIFY_USER" "$COOLIFY_KEY"
+
+  local sudoers=/etc/sudoers.d/$COOLIFY_USER
+  echo "$COOLIFY_USER ALL=(ALL) NOPASSWD: ALL" >"$sudoers.tmp"
+  chmod 440 "$sudoers.tmp"
+  visudo -cf "$sudoers.tmp" >/dev/null || { rm -f "$sudoers.tmp"; die "Règle sudoers invalide pour $COOLIFY_USER."; }
+  mv "$sudoers.tmp" "$sudoers"
+  [[ $(su - "$COOLIFY_USER" -c 'sudo -n whoami') == root ]] || die "sudo sans mot de passe ne fonctionne pas pour $COOLIFY_USER."
+
+  mkdir -p /data/coolify
+  chown -R "$COOLIFY_USER:$COOLIFY_USER" /data/coolify
+  chmod -R o-rwx /data/coolify
+}
+
+# Étape seule : ajoute COOLIFY_USER à l'AllowUsers posé par la configuration de base
+coolify_allow_ssh() {
+  local conf=/etc/ssh/sshd_config.d/00-hardening.conf
+  if ! grep -qE '^AllowUsers\s' "$conf" 2>/dev/null; then
+    warn "Pas d'AllowUsers dans $conf : aucune restriction SSH à modifier."
+    return 0
+  fi
+  awk -v u="$COOLIFY_USER" '$1=="AllowUsers" {for (i=2; i<=NF; i++) if ($i==u) f=1} END {exit !f}' "$conf" && return 0
+  info "Ajout de $COOLIFY_USER à AllowUsers"
+  backup "$conf"
+  sed -i -E "s/^AllowUsers\s.*/& $COOLIFY_USER/" "$conf"
+  install -d -m 755 /run/sshd
+  sshd -t || die "Configuration sshd invalide ($conf), SSH non rechargé."
+  # Ajouter un utilisateur ne coupe aucun accès existant : un rechargement suffit
+  systemctl try-reload-or-restart ssh.service
 }
 
 # write_ssh_config "port1 [port2]" : config sshd + ssh.socket, puis redémarrage
@@ -283,7 +365,7 @@ KbdInteractiveAuthentication no
 MaxAuthTries 3
 LoginGraceTime 30
 X11Forwarding no
-AllowUsers $NEW_USER
+AllowUsers $NEW_USER${COOLIFY_USER:+ $COOLIFY_USER}
 EOF
   } >"$conf"
   # En mode ssh.socket, /run/sshd n'existe pas tant que sshd n'a pas tourné
@@ -462,6 +544,9 @@ summary() {
   ss -tlnp | grep -E "sshd|systemd" || true
   echo
   echo "Connexion : ssh -p $SSH_PORT $NEW_USER@IP_DU_VPS"
+  if [[ -n $COOLIFY_USER ]]; then
+    echo "Coolify   : Servers > Add, IP du VPS, port $SSH_PORT, utilisateur $COOLIFY_USER, clé privée générée dans Coolify"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -475,10 +560,28 @@ main() {
     confirm "Système détecté : ${PRETTY_NAME:-inconnu}, prévu pour Ubuntu. Continuer ?" n || exit 1
   fi
 
+  # Étape seule : l'utilisateur admin est celui qui a lancé sudo
+  NEW_USER=${SUDO_USER:-}
+  [[ $NEW_USER == root ]] && NEW_USER=""
+  DOCKER_GROUP=0
+  case ${1:-} in
+    "") ;;
+    docker)
+      command -v docker &>/dev/null && die "Docker est déjà installé."
+      ask_docker; step_docker; return 0 ;;
+    coolify)
+      ask_coolify; step_coolify; coolify_allow_ssh
+      echo "Coolify : Servers > Add, IP du VPS, port SSH du serveur, utilisateur $COOLIFY_USER, clé privée générée dans Coolify"
+      return 0 ;;
+    backup) BACKUP=1; step_backup; return 0 ;;
+    *) die "Étape inconnue : $1 (étapes disponibles : docker, coolify, backup)" ;;
+  esac
+
   ask_inputs
   step_packages
   step_system
   step_user
+  step_coolify
   step_ssh
   step_firewall
   step_fail2ban
