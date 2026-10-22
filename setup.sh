@@ -2,7 +2,8 @@
 # Initialisation et sécurisation d'un VPS Ubuntu (basé sur la doc "Config VPS").
 #
 # Usage (en root ou via sudo) :
-#   curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/setup.sh | sudo bash
+#   curl -fsSL https://github.com/bahaa-mn/vps-setup/releases/download/<version>/setup.sh | sudo bash
+#   (releases immuables : le fichier d'une version publiée ne peut plus changer)
 #
 # Une seule étape, après la configuration de base :
 #   curl -fsSL .../setup.sh | sudo bash -s -- <docker|coolify|backup>
