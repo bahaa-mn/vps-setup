@@ -9,8 +9,19 @@ Le script pose ses questions au début, affiche un récapitulatif, puis fait tou
 Sur le VPS, connecté en root (ou avec un utilisateur sudo) :
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bahaa-mn/vps-setup/main/setup.sh | sudo bash
+curl -fsSL https://github.com/bahaa-mn/vps-setup/releases/download/v1.0.0/setup.sh | sudo bash
 ```
+
+L'URL pointe vers une [release](https://github.com/bahaa-mn/vps-setup/releases) immuable : le fichier d'une version publiée ne peut plus être modifié, contrairement à la branche `main`.
+
+Pour vérifier le fichier avant de l'exécuter :
+
+```bash
+curl -fsSLO https://github.com/bahaa-mn/vps-setup/releases/download/v1.0.0/setup.sh
+echo "0fc0aae3a986d7724ad97701f8e0bbc6c3afae7cc9f3aaec3a2daf360f65ab09  setup.sh" | sha256sum -c && sudo bash setup.sh
+```
+
+Ou, avec la CLI GitHub, via l'attestation de la release : `gh release verify-asset v1.0.0 setup.sh -R bahaa-mn/vps-setup`
 
 ## Ce que le script demande
 
@@ -36,7 +47,7 @@ Une fois la configuration de base faite, certaines étapes peuvent être lancée
 Exemple Coolify (générer d'abord la clé dans Coolify : Keys & Tokens > Private Keys > Generate ED25519) :
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bahaa-mn/vps-setup/main/setup.sh | sudo bash -s -- coolify
+curl -fsSL https://github.com/bahaa-mn/vps-setup/releases/download/v1.0.0/setup.sh | sudo bash -s -- coolify
 ```
 
 Puis dans Coolify : Servers > Add, avec l'IP du VPS, le port SSH, l'utilisateur `coolify` et la clé générée.
@@ -44,7 +55,7 @@ Puis dans Coolify : Servers > Add, avec l'IP du VPS, le port SSH, l'utilisateur 
 Exemple Docker :
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bahaa-mn/vps-setup/main/setup.sh | sudo bash -s -- docker
+curl -fsSL https://github.com/bahaa-mn/vps-setup/releases/download/v1.0.0/setup.sh | sudo bash -s -- docker
 ```
 
 ## Après le script
