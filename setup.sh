@@ -6,7 +6,7 @@
 #   (releases immuables : le fichier d'une version publiée ne peut plus changer)
 #
 # Une seule étape, après la configuration de base :
-#   curl -fsSL .../setup.sh | sudo bash -s -- <docker|coolify|backup>
+#   curl -fsSL .../setup.sh | sudo bash -s -- <docker|coolify|backup|swap|restic>
 #
 # Les réponses sont lues sur /dev/tty, donc le mode "curl | bash" reste interactif.
 # Le port 22 reste ouvert tant que la connexion sur le nouveau port n'a pas été validée,
@@ -198,6 +198,13 @@ ask_inputs() {
   BACKUP=0
   confirm "Sauvegarde quotidienne de /etc à 2h dans /opt/backups (14 jours) ?" o && BACKUP=1
 
+  SWAP_GB=0
+  if swap_present; then
+    warn "Un swap existe déjà (swapon --show, /swapfile), étape swap ignorée."
+  elif confirm "Créer un fichier swap ?" o; then
+    ask_swap
+  fi
+
   AUTO_REBOOT=0
   confirm "Redémarrage automatique à 4h si une mise à jour l'exige (noyau, libc...) ?" o && AUTO_REBOOT=1
 
@@ -208,6 +215,11 @@ ask_inputs() {
     ask_docker
   fi
 
+  RESTIC_NAMES=()
+  if confirm "Configurer les sauvegardes chiffrées restic (S3/R2/B2, NAS, plusieurs cibles possibles) ?" n; then
+    ask_restic
+  fi
+
   echo
   info "Récapitulatif"
   echo "  Utilisateur : $NEW_USER (sudo, connexion par clé uniquement)"
@@ -216,9 +228,11 @@ ask_inputs() {
   echo "  Fuseau      : $TZ_NAME"
   echo "  Hostname    : ${NEW_HOSTNAME:-$(hostname)}"
   echo "  Sauvegarde  : $( ((BACKUP)) && echo oui || echo non)"
+  echo "  Swap        : $( ((SWAP_GB)) && echo "${SWAP_GB} Go (/swapfile)" || echo non)"
   echo "  Reboot auto : $( ((AUTO_REBOOT)) && echo 'oui (4h)' || echo non)"
   echo "  Verrouiller : $( ((LOCK_OTHERS)) && echo "$OTHER_USERS" || echo aucun)"
   echo "  Docker      : $( ((DOCKER)) && echo "oui$( ((DOCKER_GROUP)) && echo ', groupe docker pour '"$NEW_USER")" || echo non)"
+  echo "  Restic      : $( ((${#RESTIC_NAMES[@]})) && echo "${RESTIC_NAMES[*]} (chaque nuit vers 2h30)" || echo non)"
   echo "  Coolify     : $( [[ -n $COOLIFY_USER ]] && echo "$COOLIFY_USER (sudo sans mot de passe, clé Coolify uniquement)" || echo non)"
   echo "  + mise à jour système, Fail2ban, mises à jour de sécurité automatiques"
   confirm "Lancer la configuration ?" o || die "Annulé."
@@ -246,11 +260,110 @@ ask_coolify() {
   done
 }
 
+swap_present() { [[ -e /swapfile || -n $(swapon --show --noheadings) ]]; }
+
+ask_swap() {
+  while :; do
+    ask SWAP_GB "Taille du swap en Go" "4"
+    if [[ $SWAP_GB =~ ^[0-9]+$ ]]; then
+      SWAP_GB=$((10#$SWAP_GB))
+      (( SWAP_GB >= 1 && SWAP_GB <= 64 )) && break
+    fi
+    warn "Taille invalide (1-64)."
+  done
+}
+
 ask_docker() {
   DOCKER=1
   if [[ -n $NEW_USER ]] && confirm "Ajouter $NEW_USER au groupe docker (docker sans sudo, équivalent à un accès root) ?" n; then
     DOCKER_GROUP=1
   fi
+}
+
+# kv CLE valeur : ligne d'un fichier .env relu par bash (valeur échappée)
+kv() { printf '%s=%q\n' "$1" "$2"; }
+
+# Cibles restic : une entrée par cible dans RESTIC_NAMES / RESTIC_ENVS / RESTIC_PASSES
+ask_restic() {
+  local choice name def env url bucket user secret dest port path prune_def pass n dup more=o
+  local host=${NEW_HOSTNAME:-$(hostname)} key=/etc/restic/id_ed25519
+  RESTIC_NAMES=() RESTIC_ENVS=() RESTIC_PASSES=() RESTIC_GENERATED=()
+  ask RESTIC_PATHS "Dossiers à sauvegarder (séparés par des espaces, les absents sont ignorés)" "/etc /home /root /data /var/lib/docker/volumes"
+  echo "Les bases de données doivent être exportées (dump) dans un de ces dossiers : une copie à chaud de leurs fichiers peut être incohérente."
+  while :; do
+    echo
+    echo "Cible de sauvegarde n°$(( ${#RESTIC_NAMES[@]} + 1 )) :"
+    echo "  1) Stockage S3 (Cloudflare R2, Backblaze B2, Wasabi, Scaleway, MinIO...)"
+    echo "  2) rest-server (NAS, serveur de sauvegarde central)"
+    echo "  3) SFTP (NAS ou serveur accessible en SSH)"
+    ask choice "Choix" "1"
+    case $choice in
+      1)
+        while :; do
+          ask url "URL S3 (R2 : https://<compte>.r2.cloudflarestorage.com, B2 : https://s3.<region>.backblazeb2.com)"
+          url=${url%/}
+          [[ $url =~ ^https?://[^/[:space:]]+$ ]] && break
+          warn "URL invalide (https://hôte, sans chemin)."
+        done
+        while :; do ask bucket "Bucket"; [[ $bucket =~ ^[a-z0-9][a-z0-9.-]{1,62}$ ]] && break; warn "Nom de bucket invalide."; done
+        ask user "Access key ID"
+        read -rsp "Secret access key : " secret </dev/tty; echo
+        env="$(kv RESTIC_REPOSITORY "s3:$url/$bucket/$host"; kv AWS_ACCESS_KEY_ID "$user"; kv AWS_SECRET_ACCESS_KEY "$secret")"
+        [[ $url == *.r2.cloudflarestorage.com ]] && env+=$'\n'"$(kv AWS_DEFAULT_REGION auto)"
+        case $url in *r2.cloudflarestorage*) def=r2 ;; *backblazeb2*) def=b2 ;; *) def=s3 ;; esac
+        prune_def=o ;;
+      2)
+        while :; do
+          ask url "URL du rest-server (ex: http://nas.local:8000)"
+          url=${url%/}
+          [[ $url =~ ^https?://[^/[:space:]]+$ ]] && break
+          warn "URL invalide (http(s)://hôte:port, sans chemin)."
+        done
+        ask user "Utilisateur rest-server" "$host"
+        read -rsp "Mot de passe rest-server : " secret </dev/tty; echo
+        # --private-repos : chaque utilisateur n'accède qu'au dépôt qui porte son nom
+        env="$(kv RESTIC_REPOSITORY "rest:$url/$user/"; kv RESTIC_REST_USERNAME "$user"; kv RESTIC_REST_PASSWORD "$secret")"
+        def=nas
+        prune_def=n ;;
+      3)
+        while :; do ask dest "Connexion SFTP (utilisateur@hôte)"; [[ $dest =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+$ ]] && break; warn "Format attendu : utilisateur@hôte"; done
+        while :; do ask port "Port SSH de la cible" "22"; [[ $port =~ ^[0-9]+$ ]] && (( port >= 1 && port <= 65535 )) && break; warn "Port invalide."; done
+        ask path "Dossier sur la cible" "/backups/$host"
+        if [[ ! -f $key ]]; then
+          install -d -m 700 /etc/restic
+          ssh-keygen -q -t ed25519 -N '' -C "restic@$host" -f "$key"
+        fi
+        echo "Clé publique à ajouter dans ~/.ssh/authorized_keys de ${dest%@*} sur la cible :"
+        echo
+        cat "$key.pub"
+        echo
+        confirm "Clé ajoutée sur la cible ?" o || warn "Sans cette clé, la création du dépôt échouera."
+        env="$(kv RESTIC_REPOSITORY "sftp:$dest:$path"; kv SFTP_ARGS "-i $key -p $port -o StrictHostKeyChecking=accept-new")"
+        def=nas
+        prune_def=o ;;
+      *) warn "Choix invalide."; continue ;;
+    esac
+
+    while :; do
+      ask name "Nom de la cible" "$def"
+      dup=0
+      for n in "${RESTIC_NAMES[@]}"; do [[ $n == "$name" ]] && dup=1; done
+      [[ $name =~ ^[a-z0-9-]{1,32}$ ]] && (( !dup )) && break
+      warn "Nom invalide ou déjà utilisé (minuscules, chiffres, -)."
+    done
+    if confirm "Supprimer les anciennes sauvegardes depuis ce serveur (garde 7 jours, 4 semaines, 6 mois) ? Non si la cible est en append-only" "$prune_def"; then
+      env+=$'\n'"$(kv PRUNE 1)"
+    fi
+    read -rsp "Mot de passe de chiffrement du dépôt (vide = en générer un ; dépôt existant : son mot de passe) : " pass </dev/tty; echo
+    if [[ -z $pass ]]; then
+      pass=$(openssl rand -base64 32)
+      RESTIC_GENERATED+=("$name")
+    fi
+    RESTIC_NAMES+=("$name") RESTIC_ENVS+=("$env") RESTIC_PASSES+=("$pass")
+
+    confirm "Ajouter une autre cible (ex: un NAS local en plus du stockage distant) ?" "$more" || break
+    more=n
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -466,6 +579,25 @@ step_backup() {
 EOF
 }
 
+step_swap() {
+  (( SWAP_GB )) || return 0
+  info "Swap de $SWAP_GB Go"
+  local free_gb
+  free_gb=$(df --output=avail -BG / | tail -n1 | tr -dc 0-9)
+  # Garder au moins 2 Go libres après création du swap
+  (( free_gb >= SWAP_GB + 2 )) || { warn "Espace disque insuffisant ($free_gb Go libres), swap non créé."; return 0; }
+  # fallocate n'est pas supporté partout (certains systèmes de fichiers) : dd en secours
+  fallocate -l "${SWAP_GB}G" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=$((SWAP_GB * 1024)) status=none
+  chmod 600 /swapfile
+  mkswap /swapfile >/dev/null
+  swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >>/etc/fstab
+  # Serveur : le swap sert de filet contre l'OOM, pas de mémoire courante
+  echo 'vm.swappiness=10' >/etc/sysctl.d/99-swap.conf
+  sysctl -q -p /etc/sysctl.d/99-swap.conf
+  swapon --show
+}
+
 step_docker() {
   (( DOCKER )) || return 0
   info "Docker"
@@ -493,6 +625,117 @@ EOF
   docker --version
   docker compose version
   warn "Docker contourne UFW pour les ports publiés (-p). Publier sur 127.0.0.1 ou filtrer via le pare-feu de l'hébergeur."
+}
+
+# Binaire officiel épinglé (empreintes de SHA256SUMS de la release) : apt fournit une version trop ancienne sur 22.04
+RESTIC_VERSION=0.19.1
+install_restic() {
+  local arch sum tmp
+  [[ $(restic version 2>/dev/null) == "restic $RESTIC_VERSION "* ]] && return 0
+  arch=$(dpkg --print-architecture)
+  case $arch in
+    amd64) sum=f415415624dcc452f2a02b8c33641791a8c6d6d3b65bbb3543fcf9a25151585c ;;
+    arm64) sum=a5f64aaab53d51e311fa3829124c5b703f2d14cf187d8640b6be3b2b49376465 ;;
+    *) die "Architecture $arch non prise en charge pour restic." ;;
+  esac
+  command -v bunzip2 &>/dev/null || apt-get install -y bzip2
+  tmp=$(mktemp)
+  curl -fsSL --max-time 120 "https://github.com/restic/restic/releases/download/v$RESTIC_VERSION/restic_${RESTIC_VERSION}_linux_$arch.bz2" -o "$tmp"
+  echo "$sum  $tmp" | sha256sum -c --quiet || { rm -f "$tmp"; die "Empreinte SHA256 de restic invalide."; }
+  bunzip2 -c "$tmp" >/usr/local/bin/restic.tmp
+  rm -f "$tmp"
+  chmod 755 /usr/local/bin/restic.tmp
+  mv /usr/local/bin/restic.tmp /usr/local/bin/restic
+  restic version
+}
+
+step_restic() {
+  (( ${#RESTIC_NAMES[@]} )) || return 0
+  info "Sauvegardes restic vers : ${RESTIC_NAMES[*]}"
+  local i n out
+  install_restic
+  install -d -m 700 /etc/restic /etc/restic/targets
+  printf '%s\n' $RESTIC_PATHS >/etc/restic/paths
+
+  cat >/usr/local/sbin/restic-backup <<'EOF'
+#!/bin/bash
+# Généré par setup.sh.
+#   restic-backup                     sauvegarde vers chaque cible de /etc/restic/targets
+#   restic-backup <cible> <commande>  commande restic sur une cible (ex: restic-backup nas snapshots)
+set -uo pipefail
+export RESTIC_CACHE_DIR=/var/cache/restic
+r() { restic ${SFTP_ARGS:+-o "sftp.args=$SFTP_ARGS"} "$@"; }
+load() { set -a; . "/etc/restic/targets/$1.env" || exit 1; set +a; }
+
+if (( $# )); then load "$1"; shift; r "$@"; exit; fi
+
+mapfile -t paths < <(while read -r p; do [[ -e $p ]] && echo "$p"; done </etc/restic/paths)
+fail=0
+for f in /etc/restic/targets/*.env; do
+  n=$(basename "$f" .env)
+  echo "== $n"
+  # Une cible en panne n'empêche pas la sauvegarde vers les autres
+  ( load "$n"
+    r backup --tag auto "${paths[@]}" || exit
+    if [[ ${PRUNE:-0} == 1 ]]; then r forget --tag auto --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune; fi
+  ) || { echo "Échec de la sauvegarde vers $n" >&2; fail=1; }
+done
+exit $fail
+EOF
+  chmod 750 /usr/local/sbin/restic-backup
+
+  for i in "${!RESTIC_NAMES[@]}"; do
+    n=${RESTIC_NAMES[i]}
+    (
+      umask 077
+      printf '%s\n' "${RESTIC_PASSES[i]}" >"/etc/restic/targets/$n.pass"
+      { printf '%s\n' "${RESTIC_ENVS[i]}"; kv RESTIC_PASSWORD_FILE "/etc/restic/targets/$n.pass"; } >"/etc/restic/targets/$n.env"
+    )
+    # init directement : un "cat config" sur un bucket absent réessaie pendant de longues minutes
+    if out=$(timeout 120 /usr/local/sbin/restic-backup "$n" init 2>&1); then
+      echo "Dépôt $n créé."
+    elif [[ $out == *"already exists"* ]]; then
+      echo "Dépôt $n existant, réutilisé."
+    else
+      printf '%s\n' "$out" | tail -n 3
+      warn "Création du dépôt $n impossible (identifiants, URL, clé SSH ?). Corriger /etc/restic/targets/$n.env puis : restic-backup $n init"
+    fi
+  done
+
+  cat >/etc/systemd/system/restic-backup.service <<'EOF'
+[Unit]
+Description=Sauvegarde restic (setup.sh)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/restic-backup
+Nice=10
+IOSchedulingClass=idle
+EOF
+  # Après la sauvegarde de /etc (2h) et avant le redémarrage automatique (4h)
+  cat >/etc/systemd/system/restic-backup.timer <<'EOF'
+[Unit]
+Description=Sauvegarde restic quotidienne
+
+[Timer]
+OnCalendar=*-*-* 02:30
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now restic-backup.timer
+  systemctl start --no-block restic-backup.service
+  echo "Première sauvegarde lancée en arrière-plan : journalctl -fu restic-backup"
+
+  for n in "${RESTIC_GENERATED[@]}"; do
+    warn "Mot de passe généré pour $n, à conserver HORS du serveur (sans lui, restauration impossible) :"
+    echo "    $(cat "/etc/restic/targets/$n.pass")"
+  done
 }
 
 step_lock_others() {
@@ -575,12 +818,17 @@ main() {
       echo "Coolify : Servers > Add, IP du VPS, port SSH du serveur, utilisateur $COOLIFY_USER, clé privée générée dans Coolify"
       return 0 ;;
     backup) BACKUP=1; step_backup; return 0 ;;
-    *) die "Étape inconnue : $1 (étapes disponibles : docker, coolify, backup)" ;;
+    swap)
+      swap_present && die "Un swap existe déjà (swapon --show, /swapfile)."
+      ask_swap; step_swap; return 0 ;;
+    restic) ask_restic; step_restic; return 0 ;;
+    *) die "Étape inconnue : $1 (étapes disponibles : docker, coolify, backup, swap, restic)" ;;
   esac
 
   ask_inputs
   step_packages
   step_system
+  step_swap
   step_user
   step_coolify
   step_ssh
@@ -590,6 +838,7 @@ main() {
   step_backup
   step_docker
   step_finalize
+  step_restic
   summary
 }
 
