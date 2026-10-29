@@ -280,6 +280,14 @@ ask_docker() {
   fi
 }
 
+# cleartext_ok url : vrai pour https, une adresse locale, ou après confirmation explicite
+# (en http, les identifiants rest-server et les requêtes S3 signées circulent en clair)
+cleartext_ok() {
+  [[ $1 == https://* || $1 =~ ^http://(localhost|127\.[0-9.]+)(:[0-9]+)?$ ]] && return 0
+  warn "$1 n'est pas chiffré : les identifiants de la cible y circulent en clair chaque nuit."
+  confirm "Utiliser quand même http (réseau de confiance ou tunnel VPN uniquement) ?" n
+}
+
 # kv CLE valeur : ligne d'un fichier .env relu par bash (valeur échappée)
 kv() { printf '%s=%q\n' "$1" "$2"; }
 
@@ -302,8 +310,11 @@ ask_restic() {
         while :; do
           ask url "URL S3 (R2 : https://<compte>.r2.cloudflarestorage.com, B2 : https://s3.<region>.backblazeb2.com)"
           url=${url%/}
-          [[ $url =~ ^https?://[^/[:space:]]+$ ]] && break
-          warn "URL invalide (https://hôte, sans chemin)."
+          if [[ ! $url =~ ^https?://[^/[:space:]]+$ ]]; then
+            warn "URL invalide (https://hôte, sans chemin)."
+          elif cleartext_ok "$url"; then
+            break
+          fi
         done
         while :; do ask bucket "Bucket"; [[ $bucket =~ ^[a-z0-9][a-z0-9.-]{1,62}$ ]] && break; warn "Nom de bucket invalide."; done
         ask user "Access key ID"
@@ -314,10 +325,13 @@ ask_restic() {
         prune_def=o ;;
       2)
         while :; do
-          ask url "URL du rest-server (ex: http://nas.local:8000)"
+          ask url "URL du rest-server (ex: https://nas.local:8000)"
           url=${url%/}
-          [[ $url =~ ^https?://[^/[:space:]]+$ ]] && break
-          warn "URL invalide (http(s)://hôte:port, sans chemin)."
+          if [[ ! $url =~ ^https?://[^/[:space:]]+$ ]]; then
+            warn "URL invalide (http(s)://hôte:port, sans chemin)."
+          elif cleartext_ok "$url"; then
+            break
+          fi
         done
         ask user "Utilisateur rest-server" "$host"
         read -rsp "Mot de passe rest-server : " secret </dev/tty; echo
@@ -453,6 +467,22 @@ coolify_allow_ssh() {
   systemctl try-reload-or-restart ssh.service
 }
 
+# Valeurs que sshd appliquera vraiment (sshd -T), pour chaque compte autorisé et pour root :
+# un bloc Match, un Include absent ou un AllowUsers ailleurs annuleraient sinon le durcissement
+verify_sshd_policy() {
+  local u cfg bad="" allow expected
+  for u in "$NEW_USER" ${COOLIFY_USER:+"$COOLIFY_USER"} root; do
+    cfg=$(sshd -T -C "user=$u,host=vps-setup-check,addr=203.0.113.1") || die "sshd -T impossible, SSH non redémarré."
+    grep -qx 'permitrootlogin no' <<<"$cfg" || bad+=" PermitRootLogin($u)"
+    grep -qx 'passwordauthentication no' <<<"$cfg" || bad+=" PasswordAuthentication($u)"
+    grep -qx 'kbdinteractiveauthentication no' <<<"$cfg" || bad+=" KbdInteractiveAuthentication($u)"
+  done
+  allow=$(sshd -T | awk '$1 == "allowusers" {for (i = 2; i <= NF; i++) print $i}' | sort -u | xargs)
+  expected=$(printf '%s\n' "$NEW_USER" ${COOLIFY_USER:+"$COOLIFY_USER"} | sort -u | xargs)
+  [[ $allow == "$expected" ]] || bad+=" AllowUsers($allow)"
+  [[ -z $bad ]] || die "Durcissement SSH non effectif :$bad. Chercher un bloc Match, un Include manquant ou un AllowUsers dans /etc/ssh/sshd_config et sshd_config.d/. SSH non redémarré."
+}
+
 # write_ssh_config "port1 [port2]" : config sshd + ssh.socket, puis redémarrage
 write_ssh_config() {
   local ports p f conf=/etc/ssh/sshd_config.d/00-hardening.conf
@@ -485,6 +515,7 @@ EOF
   # En mode ssh.socket, /run/sshd n'existe pas tant que sshd n'a pas tourné
   install -d -m 755 /run/sshd
   sshd -t || die "Configuration sshd invalide ($conf), SSH non redémarré."
+  verify_sshd_policy
 
   if socket_mode; then
     mkdir -p /etc/systemd/system/ssh.socket.d
@@ -763,6 +794,13 @@ step_finalize() {
     echo "    sudo whoami     # doit afficher root"
     echo
     if confirm "La connexion et sudo fonctionnent ?" n; then
+      # Le filet a pu se déclencher pendant la question : on l'arrête avant de revérifier
+      systemctl stop "$ROLLBACK_UNIT.timer" 2>/dev/null || true
+      while systemctl is-active --quiet "$ROLLBACK_UNIT.service"; do sleep 1; done
+      if rollback_fired; then
+        warn "Le filet de sécurité s'est déclenché pendant la question : ré-application, refaire le test."
+        continue
+      fi
       disarm_rollback
       if (( SSH_PORT != 22 )); then
         info "Fermeture du port 22"
