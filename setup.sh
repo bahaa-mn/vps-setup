@@ -100,8 +100,8 @@ ask_inputs() {
     ask NEW_USER "Nom de l'utilisateur admin à créer"
     if [[ ! $NEW_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ || $NEW_USER == root ]]; then
       warn "Nom invalide (minuscules, chiffres, _ ou -, 32 caractères max, pas root)."
-    elif id "$NEW_USER" &>/dev/null && (( $(id -u "$NEW_USER") < 1000 )); then
-      warn "$NEW_USER est un compte système (UID < 1000), choisir un autre nom."
+    elif system_account "$NEW_USER"; then
+      warn "$NEW_USER est un compte système, choisir un autre nom."
     else
       break
     fi
@@ -238,6 +238,15 @@ ask_inputs() {
   confirm "Lancer la configuration ?" o || die "Annulé."
 }
 
+# UID hors de la plage des comptes humains (login.defs), nobody (65534) compris
+system_account() {
+  local uid min max
+  uid=$(id -u "$1" 2>/dev/null) || return 1
+  min=$(awk '$1 == "UID_MIN" {print $2}' /etc/login.defs 2>/dev/null)
+  max=$(awk '$1 == "UID_MAX" {print $2}' /etc/login.defs 2>/dev/null)
+  (( uid < ${min:-1000} || uid > ${max:-60000} ))
+}
+
 # Compte dédié à un serveur Coolify central (doc : coolify.io/docs/core/infrastructure/servers/non-root-user)
 ask_coolify() {
   local p
@@ -245,8 +254,11 @@ ask_coolify() {
     ask COOLIFY_USER "Nom de l'utilisateur Coolify" "coolify"
     if [[ ! $COOLIFY_USER =~ ^[a-z_][a-z0-9_-]{0,31}$ || $COOLIFY_USER == root || $COOLIFY_USER == "$NEW_USER" ]]; then
       warn "Nom invalide (minuscules, chiffres, _ ou -, 32 caractères max, ni root ni l'utilisateur admin)."
-    elif id "$COOLIFY_USER" &>/dev/null && (( $(id -u "$COOLIFY_USER") < 1000 )); then
-      warn "$COOLIFY_USER est un compte système (UID < 1000), choisir un autre nom."
+    elif system_account "$COOLIFY_USER"; then
+      warn "$COOLIFY_USER est un compte système, choisir un autre nom."
+    elif id "$COOLIFY_USER" &>/dev/null && [[ ! -f /etc/sudoers.d/$COOLIFY_USER ]] \
+      && ! confirm "$COOLIFY_USER existe déjà : il recevra sudo sans mot de passe et la clé de Coolify. Continuer ?" n; then
+      :
     else
       break
     fi
@@ -284,7 +296,7 @@ ask_docker() {
 # (en http, les identifiants rest-server et les requêtes S3 signées circulent en clair)
 cleartext_ok() {
   [[ $1 == https://* || $1 =~ ^http://(localhost|127\.[0-9.]+)(:[0-9]+)?$ ]] && return 0
-  warn "$1 n'est pas chiffré : les identifiants de la cible y circulent en clair chaque nuit."
+  warn "$1 n'est pas chiffré : mot de passe rest-server lisible, requêtes S3 rejouables ou bloquables sur le trajet (les données restent chiffrées par restic)."
   confirm "Utiliser quand même http (réseau de confiance ou tunnel VPN uniquement) ?" n
 }
 

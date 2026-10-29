@@ -87,5 +87,8 @@ sudo restic-backup r2 check                          # vérifie l'intégrité du
 - Connexion : `ssh -p <port> <user>@<ip>`
 - Seul l'utilisateur créé peut se connecter (`AllowUsers`). Pour en ajouter un : `/etc/ssh/sshd_config.d/00-hardening.conf`
 - Avant de redémarrer SSH, le script vérifie avec `sshd -T` que root, les mots de passe et `AllowUsers` sont bien appliqués pour chaque compte : un bloc `Match`, un `Include` absent ou un autre `AllowUsers` dans la config existante arrête le script (le filet de sécurité restaure alors l'accès initial)
-- Cible restic en `http://` hors de la machine locale : une confirmation est demandée, car les identifiants y circulent en clair. Préférer `https://` ou un tunnel VPN
+- Cible restic en `http://` hors de la machine locale : une confirmation est demandée (mot de passe rest-server lisible, requêtes S3 rejouables). Préférer `https://` ou un tunnel VPN
+- Nom d'utilisateur : un compte système est refusé, et un compte existant ne devient utilisateur Coolify (sudo sans mot de passe) qu'après confirmation
 - Docker contourne UFW : publier les ports des conteneurs sur `127.0.0.1` ou utiliser le pare-feu de l'hébergeur
+
+La liste complète des vérifications à faire de votre côté et des limites connues est dans [SECURITY.md](SECURITY.md).
