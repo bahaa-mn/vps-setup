@@ -121,6 +121,8 @@ ask_inputs() {
       warn "Nom invalide (minuscules, chiffres, _ ou -, 32 caractères max, pas root)."
     elif system_account "$NEW_USER"; then
       warn "$NEW_USER est un compte système, choisir un autre nom."
+    elif group_only "$NEW_USER"; then
+      warn "Un groupe $NEW_USER existe déjà sur ce système, choisir un autre nom."
     elif id "$NEW_USER" &>/dev/null \
       && ! confirm "$NEW_USER existe déjà : il garde son mot de passe et ses clés SSH actuelles, et rejoint le groupe sudo. Continuer ?" n; then
       :
@@ -278,6 +280,9 @@ system_account() {
   (( uid < ${min:-1000} || uid > ${max:-60000} ))
 }
 
+# Groupe du même nom sans compte (ex: 'admin' sur Ubuntu) : adduser et useradd échoueraient
+group_only() { ! id "$1" &>/dev/null && getent group "$1" >/dev/null; }
+
 # Compte dédié à un serveur Coolify central (doc : coolify.io/docs/core/infrastructure/servers/non-root-user)
 ask_coolify() {
   local p
@@ -287,6 +292,8 @@ ask_coolify() {
       warn "Nom invalide (minuscules, chiffres, _ ou -, 32 caractères max, ni root ni l'utilisateur admin)."
     elif system_account "$COOLIFY_USER"; then
       warn "$COOLIFY_USER est un compte système, choisir un autre nom."
+    elif group_only "$COOLIFY_USER"; then
+      warn "Un groupe $COOLIFY_USER existe déjà sur ce système, choisir un autre nom."
     elif id "$COOLIFY_USER" &>/dev/null \
       && ! grep -qxF "$COOLIFY_USER ALL=(ALL) NOPASSWD: ALL" "/etc/sudoers.d/$COOLIFY_USER" 2>/dev/null \
       && ! confirm "$COOLIFY_USER existe déjà : il recevra sudo sans mot de passe et ses clés SSH actuelles seront remplacées par celle de Coolify. Continuer ?" n; then
