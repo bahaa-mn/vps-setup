@@ -9,7 +9,7 @@ Le script pose ses questions au début, affiche un récapitulatif, puis fait tou
 Sur le VPS, connecté en root (ou avec un utilisateur sudo) :
 
 ```bash
-curl -fsSL https://github.com/bahaa-mn/vps-setup/releases/download/v1.1.1/setup.sh | sudo bash
+curl -fsSL https://github.com/bahaa-mn/vps-setup/releases/download/v1.1.2/setup.sh | sudo bash
 ```
 
 L'URL pointe vers une [release](https://github.com/bahaa-mn/vps-setup/releases) immuable : le fichier d'une version publiée ne peut plus être modifié, contrairement à la branche `main`.
@@ -17,11 +17,11 @@ L'URL pointe vers une [release](https://github.com/bahaa-mn/vps-setup/releases) 
 Pour vérifier le fichier avant de l'exécuter :
 
 ```bash
-curl -fsSLO https://github.com/bahaa-mn/vps-setup/releases/download/v1.1.1/setup.sh
-echo "5f00c9e4ce9722e9847c604c3c19761ba25bf719832c0cb780e1715ac8098e7c  setup.sh" | sha256sum -c && sudo bash setup.sh
+curl -fsSLO https://github.com/bahaa-mn/vps-setup/releases/download/v1.1.2/setup.sh
+echo "1eacae723ee5ef3cdc7d548b48092097a8eeca8c67c268865dcee45a7b2e93ce  setup.sh" | sha256sum -c && sudo bash setup.sh
 ```
 
-Ou, avec la CLI GitHub, via l'attestation de la release : `gh release verify-asset v1.1.1 setup.sh -R bahaa-mn/vps-setup`
+Ou, avec la CLI GitHub, via l'attestation de la release : `gh release verify-asset v1.1.2 setup.sh -R bahaa-mn/vps-setup`
 
 ## Ce que le script demande
 
@@ -51,7 +51,7 @@ Une fois la configuration de base faite, certaines étapes peuvent être lancée
 Exemple Coolify (générer d'abord la clé dans Coolify : Keys & Tokens > Private Keys > Generate ED25519) :
 
 ```bash
-curl -fsSL https://github.com/bahaa-mn/vps-setup/releases/download/v1.1.1/setup.sh | sudo bash -s -- coolify
+curl -fsSL https://github.com/bahaa-mn/vps-setup/releases/download/v1.1.2/setup.sh | sudo bash -s -- coolify
 ```
 
 Puis dans Coolify : Servers > Add, avec l'IP du VPS, le port SSH, l'utilisateur `coolify` et la clé générée.
@@ -59,7 +59,7 @@ Puis dans Coolify : Servers > Add, avec l'IP du VPS, le port SSH, l'utilisateur 
 Exemple Docker :
 
 ```bash
-curl -fsSL https://github.com/bahaa-mn/vps-setup/releases/download/v1.1.1/setup.sh | sudo bash -s -- docker
+curl -fsSL https://github.com/bahaa-mn/vps-setup/releases/download/v1.1.2/setup.sh | sudo bash -s -- docker
 ```
 
 ## Sauvegardes restic
@@ -88,7 +88,11 @@ sudo restic-backup r2 check                          # vérifie l'intégrité du
 - Seul l'utilisateur créé peut se connecter (`AllowUsers`). Pour en ajouter un : `/etc/ssh/sshd_config.d/00-hardening.conf`
 - Avant de redémarrer SSH, le script vérifie avec `sshd -T` que root, les mots de passe et `AllowUsers` sont bien appliqués pour chaque compte : un bloc `Match`, un `Include` absent ou un autre `AllowUsers` dans la config existante arrête le script (le filet de sécurité restaure alors l'accès initial)
 - Cible restic en `http://` hors de la machine locale : une confirmation est demandée (mot de passe rest-server lisible, requêtes S3 rejouables). Préférer `https://` ou un tunnel VPN
-- Nom d'utilisateur : un compte système est refusé, et un compte existant ne devient utilisateur Coolify (sudo sans mot de passe) qu'après confirmation
+- Nom d'utilisateur : un compte système est refusé. Un compte existant n'est repris qu'après confirmation : comme admin, il garde son mot de passe et ses clés ; comme utilisateur Coolify, ses clés sont remplacées par la seule clé de Coolify (ancien fichier sauvegardé)
+- Clés reprises de root : les lignes commentées sont ignorées, seul le message cloud-init « Please login as » est retiré, les autres options (`command=`, `from=`, `restrict`...) sont gardées
+- Clés écrites en tant que l'utilisateur concerné : un lien symbolique posé dans son dossier ne peut pas viser un fichier de root
+- Bloc `Match` dans la config SSH existante : le script demande de confirmer qu'il ne réautorise ni root ni les mots de passe, sinon il s'arrête
+- Filet de sécurité : chaque lancement prend un instantané neuf de la config SSH (sauf si le filet d'un lancement interrompu est encore armé), un ancien instantané ne peut plus écraser le durcissement en place
 - Docker contourne UFW : publier les ports des conteneurs sur `127.0.0.1` ou utiliser le pare-feu de l'hébergeur
 
 La liste complète des vérifications à faire de votre côté et des limites connues est dans [SECURITY.md](SECURITY.md).

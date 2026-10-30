@@ -41,6 +41,18 @@ backup() { if [[ -f $1 ]]; then cp -a "$1" "$1.bak.$(date +%s)"; fi; }
 # Garde uniquement les clés publiques valides, sans les options type command="..."
 extract_keys() { grep -oE '(ssh|ecdsa|sk)-[a-z0-9@.-]+ AAAA[A-Za-z0-9+/=]+( .*)?$' || true; }
 
+# Clés de root : commentaires ignorés, seul le préfixe cloud-init « Please login as » est retiré,
+# les autres options (command=, from=, restrict...) sont gardées : elles limitent la clé
+root_keys() {
+  local l ci='no-port-forwarding,no-agent-forwarding,no-X11-forwarding,command="echo '\''Please login as the user '
+  while IFS= read -r l || [[ -n $l ]]; do
+    [[ $l =~ ^[[:space:]]*(#|$) ]] && continue
+    if [[ $l =~ ^(ssh|ecdsa|sk)- ]]; then printf '%s\n' "$l"
+    elif [[ $l == "$ci"* ]]; then extract_keys <<<"$l"
+    else warn "Clé avec options gardée telle quelle : ${l:0:70}..." >&2; printf '%s\n' "$l"; fi
+  done
+}
+
 socket_mode() { systemctl is-enabled --quiet ssh.socket 2>/dev/null || systemctl is-active --quiet ssh.socket; }
 
 # ---------------------------------------------------------------------------
@@ -53,6 +65,13 @@ ROLLBACK_MIN=30
 
 arm_rollback() {
   local restart
+  # Premier armement du lancement : instantané neuf, sauf si le filet d'un lancement interrompu
+  # est encore armé (il doit pouvoir restaurer l'accès d'origine). Un instantané plus ancien
+  # restaurerait sinon une config dépassée par-dessus le durcissement en place.
+  if [[ -z ${SNAPSHOT_TAKEN:-} ]] && ! systemctl is-active --quiet "$ROLLBACK_UNIT.timer"; then
+    rm -rf "$STATE_DIR"
+  fi
+  SNAPSHOT_TAKEN=1
   if [[ ! -d $STATE_DIR/ssh ]]; then
     mkdir -p "$STATE_DIR/ssh"
     cp -a /etc/ssh/sshd_config /etc/ssh/sshd_config.d "$STATE_DIR/ssh/"
@@ -102,6 +121,9 @@ ask_inputs() {
       warn "Nom invalide (minuscules, chiffres, _ ou -, 32 caractères max, pas root)."
     elif system_account "$NEW_USER"; then
       warn "$NEW_USER est un compte système, choisir un autre nom."
+    elif id "$NEW_USER" &>/dev/null \
+      && ! confirm "$NEW_USER existe déjà : il garde son mot de passe et ses clés SSH actuelles, et rejoint le groupe sudo. Continuer ?" n; then
+      :
     else
       break
     fi
@@ -169,7 +191,7 @@ ask_inputs() {
     echo "  3) Importer depuis GitHub (https://github.com/<user>.keys)"
     ask choice "Choix" "1"
     case $choice in
-      1) SSH_KEYS=$(extract_keys </root/.ssh/authorized_keys 2>/dev/null) ;;
+      1) SSH_KEYS=""; [[ -r /root/.ssh/authorized_keys ]] && SSH_KEYS=$(root_keys </root/.ssh/authorized_keys) ;;
       2) ask p "Clé publique"; SSH_KEYS=$(extract_keys <<<"$p") ;;
       3) ask gh "Utilisateur GitHub"
          if [[ $gh =~ ^[A-Za-z0-9-]+$ ]]; then
@@ -182,6 +204,15 @@ ask_inputs() {
       warn "Aucune clé valide trouvée, recommencer."; SSH_KEYS=""
     fi
   done
+
+  # sshd -T ne vérifie qu'une connexion type : un Match sur une autre adresse ou un autre port
+  # pourrait réautoriser root ou les mots de passe sans être vu
+  p=$(grep -lsE '^[[:space:]]*Match[[:space:]]' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf | xargs || true)
+  if [[ -n $p ]]; then
+    warn "Bloc(s) Match dans : $p"
+    confirm "Ces blocs ont été relus et ne réautorisent ni root, ni les mots de passe, ni d'autres utilisateurs ?" n \
+      || die "Retirer ou corriger les blocs Match, puis relancer."
+  fi
 
   while :; do
     ask TZ_NAME "Fuseau horaire" "Europe/Paris"
@@ -256,8 +287,9 @@ ask_coolify() {
       warn "Nom invalide (minuscules, chiffres, _ ou -, 32 caractères max, ni root ni l'utilisateur admin)."
     elif system_account "$COOLIFY_USER"; then
       warn "$COOLIFY_USER est un compte système, choisir un autre nom."
-    elif id "$COOLIFY_USER" &>/dev/null && [[ ! -f /etc/sudoers.d/$COOLIFY_USER ]] \
-      && ! confirm "$COOLIFY_USER existe déjà : il recevra sudo sans mot de passe et la clé de Coolify. Continuer ?" n; then
+    elif id "$COOLIFY_USER" &>/dev/null \
+      && ! grep -qxF "$COOLIFY_USER ALL=(ALL) NOPASSWD: ALL" "/etc/sudoers.d/$COOLIFY_USER" 2>/dev/null \
+      && ! confirm "$COOLIFY_USER existe déjà : il recevra sudo sans mot de passe et ses clés SSH actuelles seront remplacées par celle de Coolify. Continuer ?" n; then
       :
     else
       break
@@ -425,18 +457,20 @@ step_user() {
   install_keys "$NEW_USER" "$SSH_KEYS"
 }
 
-# install_keys user "clés" : ajoute les clés manquantes à ~user/.ssh/authorized_keys
+# install_keys user "clés" [replace] : ajoute les clés manquantes à ~user/.ssh/authorized_keys
+# (replace : remplace les clés existantes, ancien fichier sauvegardé). Écritures faites en tant
+# que l'utilisateur : un lien posé dans son dossier ne peut pas viser un fichier de root.
 install_keys() {
-  local home ak k
+  local home
   home=$(getent passwd "$1" | cut -d: -f6)
-  ak="$home/.ssh/authorized_keys"
-  install -d -m 700 -o "$1" -g "$1" "$home/.ssh"
-  touch "$ak"
-  while IFS= read -r k; do
-    if ! grep -qxF "$k" "$ak"; then echo "$k" >>"$ak"; fi
-  done <<<"$2"
-  chown "$1:$1" "$ak"
-  chmod 600 "$ak"
+  printf '%s\n' "$2" | runuser -u "$1" -- bash -c '
+    set -eu; umask 077; d=$1/.ssh; ak=$d/authorized_keys; keys=$(cat)
+    mkdir -p "$d"; chmod 700 "$d"
+    if [[ $2 == replace && -s $ak && $(cat "$ak") != "$keys" ]]; then cp "$ak" "$ak.bak.$(date +%s)"; : >"$ak"; fi
+    touch "$ak"; chmod 600 "$ak"
+    while IFS= read -r k; do
+      [[ -z $k ]] || grep -qxF -- "$k" "$ak" || printf "%s\n" "$k" >>"$ak"
+    done <<<"$keys"' _ "$home" "${3:-}" || die "Impossible d'écrire les clés SSH de $1 ($home/.ssh)."
 }
 
 step_coolify() {
@@ -448,7 +482,8 @@ step_coolify() {
   elif [[ $(passwd -S "$COOLIFY_USER" | awk '{print $2}') == L ]]; then
     usermod -p 'NP' "$COOLIFY_USER"
   fi
-  install_keys "$COOLIFY_USER" "$COOLIFY_KEY"
+  # La clé Coolify est la seule acceptée : ce compte a sudo sans mot de passe
+  install_keys "$COOLIFY_USER" "$COOLIFY_KEY" replace
 
   local sudoers=/etc/sudoers.d/$COOLIFY_USER
   echo "$COOLIFY_USER ALL=(ALL) NOPASSWD: ALL" >"$sudoers.tmp"
@@ -826,7 +861,7 @@ step_finalize() {
     confirm "Réessayer le test ?" o && continue
     warn "Durcissement laissé en place, port 22 toujours ouvert, cette session reste utilisable."
     warn "Sans validation, la config SSH initiale sera restaurée automatiquement (délai : $ROLLBACK_MIN min depuis l'armement)."
-    warn "Pour garder le durcissement malgré tout : systemctl stop $ROLLBACK_UNIT.timer"
+    warn "Pour garder le durcissement malgré tout : systemctl stop $ROLLBACK_UNIT.timer && rm -rf $STATE_DIR"
     return 0
   done
 }
